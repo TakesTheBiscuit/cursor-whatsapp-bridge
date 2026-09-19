@@ -8,12 +8,16 @@ export type BridgeState = {
   sessionId: string | null;
   lastProcessedTs: number;
   status: BridgeStatus;
+  processedIds: string[];
+  selfJids: string[];
 };
 
 const EMPTY: BridgeState = {
   sessionId: null,
   lastProcessedTs: 0,
   status: "idle",
+  processedIds: [],
+  selfJids: [],
 };
 
 let cache: BridgeState | null = null;
@@ -32,6 +36,8 @@ export async function loadState(): Promise<BridgeState> {
       sessionId: parsed.sessionId ?? null,
       lastProcessedTs: Number(parsed.lastProcessedTs) || 0,
       status: parsed.status === "busy" ? "idle" : (parsed.status ?? "idle"),
+      processedIds: Array.isArray(parsed.processedIds) ? parsed.processedIds.filter((id) => typeof id === "string") : [],
+      selfJids: Array.isArray(parsed.selfJids) ? parsed.selfJids.filter((id) => typeof id === "string") : [],
     };
   } catch {
     cache = { ...EMPTY };
@@ -55,4 +61,24 @@ export async function appendThread(
   await mkdir(dirname(THREAD_PATH), { recursive: true });
   const line = JSON.stringify({ ts: Date.now(), role, text }) + "\n";
   await appendFile(THREAD_PATH, line, "utf8");
+}
+
+const PROCESSED_CAP = 400;
+const SELF_JID_CAP = 20;
+
+export async function rememberProcessedId(id: string): Promise<void> {
+  const state = await loadState();
+  if (state.processedIds.includes(id)) return;
+  const processedIds = [...state.processedIds, id];
+  if (processedIds.length > PROCESSED_CAP) processedIds.splice(0, processedIds.length - PROCESSED_CAP);
+  await saveState({ processedIds });
+}
+
+export async function rememberSelfJid(jid: string): Promise<void> {
+  const normalized = jid.trim();
+  if (!normalized) return;
+  const state = await loadState();
+  if (state.selfJids.includes(normalized)) return;
+  const selfJids = [...state.selfJids, normalized].slice(-SELF_JID_CAP);
+  await saveState({ selfJids });
 }

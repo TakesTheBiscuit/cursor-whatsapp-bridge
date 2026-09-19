@@ -63,11 +63,6 @@ async function main(): Promise<void> {
   console.log(`Workspace: ${WORKSPACE_PATH}`);
   await startWhatsApp({
     startedAtSec,
-    getLastProcessedTs: async () => (await loadState()).lastProcessedTs,
-    markProcessed: async (ts) => {
-      const state = await loadState();
-      if (ts > state.lastProcessedTs) await saveState({ lastProcessedTs: ts });
-    },
     onMessage: async (msg) => {
       const text = msg.text.trim();
       const reply = (body: string) => sendText(msg.jid, body);

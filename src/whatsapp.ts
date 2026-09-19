@@ -2,9 +2,11 @@ import { Boom } from "@hapi/boom";
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  areJidsSameUser,
   fetchLatestBaileysVersion,
   isJidBroadcast,
   isJidGroup,
+  isJidNewsletter,
   isJidStatusBroadcast,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -16,6 +18,7 @@ import { mkdir } from "node:fs/promises";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { AUTH_DIR, WHATSAPP_CHUNK } from "./config.ts";
+import { loadState, rememberProcessedId, rememberSelfJid } from "./state.ts";
 
 export type Incoming = {
   jid: string;
@@ -28,13 +31,16 @@ export type Incoming = {
 type StartOpts = {
   onMessage: (msg: Incoming) => Promise<void>;
   startedAtSec: number;
-  getLastProcessedTs: () => Promise<number>;
-  markProcessed: (ts: number) => Promise<void>;
 };
+
+type MeContact = { id?: string; lid?: string; jid?: string };
 
 const logger = pino({ level: "silent" });
 const outboundIds = new Set<string>();
+const outboundBodies = new Set<string>();
 const OUTBOUND_CAP = 500;
+const HISTORY_GRACE_SEC = 20;
+const messageCache = new Map<string, NonNullable<WAMessage["message"]>>();
 
 let sock: WASocket | null = null;
 let reconnecting = false;
@@ -66,6 +72,8 @@ function unwrapMessage(msg: WAMessage["message"]): ProtoMessage | undefined {
   if (node.documentWithCaptionMessage?.message) {
     return unwrapMessage(node.documentWithCaptionMessage.message);
   }
+  const edited = node.protocolMessage?.editedMessage;
+  if (edited) return unwrapMessage(edited);
   return node;
 }
 
@@ -84,27 +92,48 @@ export function extractText(message: WAMessage): string {
   ).trim();
 }
 
-function meJids(socket: WASocket): Set<string> {
-  const out = new Set<string>();
-  const add = (jid?: string | null) => {
-    if (!jid) return;
-    out.add(jidNormalizedUser(jid));
-  };
-  const user = socket.user as { id?: string; lid?: string; jid?: string } | undefined;
-  add(user?.id);
-  add(user?.lid);
-  add(user?.jid);
-  return out;
+function messageTs(message: WAMessage): number {
+  const t = message.messageTimestamp as unknown;
+  if (typeof t === "number") return t;
+  if (typeof t === "bigint") return Number(t);
+  if (t && typeof t === "object" && "toNumber" in t && typeof t.toNumber === "function") {
+    return t.toNumber();
+  }
+  return 0;
 }
 
-function isSelfChat(socket: WASocket, remoteJid: string | null | undefined): boolean {
-  if (!remoteJid) return false;
-  if (isJidGroup(remoteJid) || isJidBroadcast(remoteJid) || isJidStatusBroadcast(remoteJid)) {
-    return false;
+function meIdentities(socket: WASocket): string[] {
+  const user = socket.user as MeContact | undefined;
+  const me = socket.authState?.creds?.me as MeContact | undefined;
+  const ids = [user?.id, user?.lid, user?.jid, me?.id, me?.lid, me?.jid];
+  return [...new Set(ids.filter((id): id is string => Boolean(id)))];
+}
+
+function isIgnoredChat(remoteJid: string): boolean {
+  return (
+    isJidGroup(remoteJid) ||
+    isJidBroadcast(remoteJid) ||
+    isJidStatusBroadcast(remoteJid) ||
+    isJidNewsletter(remoteJid) ||
+    remoteJid === "status@broadcast"
+  );
+}
+
+function isSelfChat(socket: WASocket, message: WAMessage, learned: string[]): boolean {
+  const remoteJid = message.key.remoteJid;
+  if (!remoteJid || isIgnoredChat(remoteJid)) return false;
+
+  const identities = [...meIdentities(socket), ...learned];
+  for (const me of identities) {
+    if (areJidsSameUser(remoteJid, me)) return true;
+    if (jidNormalizedUser(remoteJid) === jidNormalizedUser(me)) return true;
   }
-  if (remoteJid.endsWith("@newsletter") || remoteJid === "status@broadcast") return false;
-  const remote = jidNormalizedUser(remoteJid);
-  return meJids(socket).has(remote);
+
+  const senderLid = message.key.senderLid;
+  // Note-to-self over LID: chat JID is our own LID, which may be unknown at startup.
+  if (message.key.fromMe && senderLid && areJidsSameUser(remoteJid, senderLid)) return true;
+
+  return false;
 }
 
 export function chunkText(text: string, limit = WHATSAPP_CHUNK): string[] {
@@ -124,10 +153,19 @@ export function chunkText(text: string, limit = WHATSAPP_CHUNK): string[] {
 export async function sendText(jid: string, text: string): Promise<void> {
   if (!sock) throw new Error("WhatsApp is not connected");
   const body = text.trim() || "(empty)";
+  outboundBodies.add(body);
+  setTimeout(() => outboundBodies.delete(body), 60_000).unref();
   for (const part of chunkText(body)) {
+    outboundBodies.add(part);
+    setTimeout(() => outboundBodies.delete(part), 60_000).unref();
     const sent = await sock.sendMessage(jid, { text: part });
     rememberOutbound(sent?.key?.id);
   }
+}
+
+function preview(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= 80 ? flat : `${flat.slice(0, 77)}...`;
 }
 
 async function connect(opts: StartOpts): Promise<void> {
@@ -143,9 +181,13 @@ async function connect(opts: StartOpts): Promise<void> {
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     logger,
-    browser: Browsers.ubuntu("Cursor Bridge"),
+    browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
+    getMessage: async (key) => {
+      if (!key.id) return undefined;
+      return messageCache.get(key.id);
+    },
   });
   sock = socket;
 
@@ -159,9 +201,9 @@ async function connect(opts: StartOpts): Promise<void> {
     }
     if (connection === "open") {
       reconnecting = false;
-      const me = [...meJids(socket)].join(", ") || "(unknown)";
+      const me = meIdentities(socket).join(", ") || "(unknown)";
       console.log(`WhatsApp connected as ${me}`);
-      console.log('Only the "Message yourself" chat is accepted.');
+      console.log('Send a prompt in "Message yourself". Terminal will log every inbound chat.');
     }
     if (connection === "close") {
       sock = null;
@@ -173,7 +215,7 @@ async function connect(opts: StartOpts): Promise<void> {
       }
       if (stopped || reconnecting) return;
       reconnecting = true;
-      const delay = 2000;
+      const delay = status === 515 ? 1000 : 2000;
       console.log(`WhatsApp disconnected (status ${status ?? "?"}). Reconnecting…`);
       setTimeout(() => {
         reconnecting = false;
@@ -184,39 +226,93 @@ async function connect(opts: StartOpts): Promise<void> {
     }
   });
 
-  socket.ev.on("messages.upsert", async ({ messages }) => {
+  socket.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const message of messages) {
       try {
-        await handleIncoming(socket, message, opts);
+        await handleIncoming(socket, message, opts, type);
       } catch (err) {
         console.error("Failed to handle message:", err);
       }
     }
   });
+
+  socket.ev.on("messages.update", async (updates) => {
+    for (const { key, update } of updates) {
+      if (!update.message) continue;
+      const message: WAMessage = {
+        key,
+        message: update.message,
+        messageTimestamp: Math.floor(Date.now() / 1000),
+      };
+      try {
+        await handleIncoming(socket, message, opts, "update");
+      } catch (err) {
+        console.error("Failed to handle message update:", err);
+      }
+    }
+  });
 }
 
-async function handleIncoming(socket: WASocket, message: WAMessage, opts: StartOpts): Promise<void> {
+async function handleIncoming(
+  socket: WASocket,
+  message: WAMessage,
+  opts: StartOpts,
+  source: string,
+): Promise<void> {
   const id = message.key.id;
   const remoteJid = message.key.remoteJid;
-  const ts = Number(message.messageTimestamp || 0);
-  if (!id || !remoteJid) return;
-  if (outboundIds.has(id)) return;
-  if (!isSelfChat(socket, remoteJid)) return;
-
-  const lastTs = await opts.getLastProcessedTs();
-  const cutoff = Math.max(opts.startedAtSec, lastTs);
-  if (ts <= cutoff) return;
-
+  const ts = messageTs(message);
+  const fromMe = Boolean(message.key.fromMe);
   const text = extractText(message);
-  await opts.markProcessed(ts);
-  if (!text) return;
+
+  if (message.message && id) {
+    messageCache.set(id, message.message);
+  }
+
+  if (!id || !remoteJid) {
+    console.log(`recv ${source} skip=no-id jid=${remoteJid ?? "?"}`);
+    return;
+  }
+  if (outboundIds.has(id)) return;
+  if (fromMe && text && outboundBodies.has(text)) {
+    rememberOutbound(id);
+    return;
+  }
+
+  const state = await loadState();
+  if (state.processedIds.includes(id)) return;
+
+  if (isIgnoredChat(remoteJid)) return;
+
+  const self = isSelfChat(socket, message, state.selfJids);
+  console.log(
+    `recv ${source} fromMe=${fromMe} jid=${jidNormalizedUser(remoteJid) || remoteJid}` +
+      `${message.key.senderLid ? ` lid=${message.key.senderLid}` : ""}` +
+      ` ts=${ts} self=${self} text="${preview(text)}"`,
+  );
+
+  if (!self) return;
+
+  if (ts && ts < opts.startedAtSec - HISTORY_GRACE_SEC) {
+    console.log(`skip ${id}: older than session start`);
+    return;
+  }
+
+  if (!text) {
+    console.log(`skip ${id}: no text payload (waiting for decrypt/update)`);
+    return;
+  }
+
+  await rememberProcessedId(id);
+  await rememberSelfJid(jidNormalizedUser(remoteJid) || remoteJid);
+  if (message.key.senderLid) await rememberSelfJid(jidNormalizedUser(message.key.senderLid));
 
   await opts.onMessage({
     jid: remoteJid,
     text,
     id,
     ts,
-    fromMe: Boolean(message.key.fromMe),
+    fromMe,
   });
 }
 
@@ -237,5 +333,5 @@ export function stopWhatsApp(): void {
 
 export function connectedAs(): string {
   if (!sock?.user) return "offline";
-  return [...meJids(sock)].join(", ") || "online";
+  return meIdentities(sock).join(", ") || "online";
 }
