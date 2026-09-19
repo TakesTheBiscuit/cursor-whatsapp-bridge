@@ -3,6 +3,8 @@ import {
   CURSOR_API_KEY,
   CURSOR_BIN,
   CURSOR_MODEL,
+  STUCK_MS,
+  WATCHDOG_MS,
   WORKSPACE_PATH,
 } from "./config.ts";
 import { appendThread, loadState, saveState } from "./state.ts";
@@ -12,10 +14,30 @@ const PROMPT_PREFIX = `You are being driven via WhatsApp. Reply with a concise h
 User message:
 `;
 
+const WAKE_PROMPT = `Wake up / status please. The previous Cursor CLI run looked stuck (still running with other WhatsApp prompts waiting). Reply with a short status of what you last completed, whether you are blocked, and the next step. Continue the active task if you can; do not restart from scratch.`;
+
 export type Job = {
   prompt: string;
   reply: (text: string) => Promise<void>;
+  kind?: "user" | "wakeup";
 };
+
+export type RunnerSnapshot = {
+  busy: boolean;
+  queueLength: number;
+  runningMs: number | null;
+  currentPrompt: string | null;
+  nudgesThisRun: number;
+};
+
+function failMessage(err: unknown): string {
+  const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code) : "";
+  if (code === "ENOENT") {
+    return "Cursor CLI not found. Install it (`curl https://cursor.com/install -fsS | bash`) and ensure `agent` is on PATH.";
+  }
+  if (err instanceof globalThis.Error) return err.message;
+  return "failed to start agent";
+}
 
 function lastUsefulLine(text: string): string {
   const lines = text
@@ -59,15 +81,22 @@ function parseAgentStdout(stdout: string): { result: string; session_id?: string
   throw new Error(lastUsefulLine(trimmed) || "agent produced no JSON result");
 }
 
+function agentEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (CURSOR_API_KEY) env.CURSOR_API_KEY = CURSOR_API_KEY;
+  const home = env.HOME || "";
+  const extra = [`${home}/.local/bin`, `${home}/.cursor/bin`].filter(Boolean).join(":");
+  env.PATH = extra ? `${extra}:${env.PATH || ""}` : env.PATH;
+  return env;
+}
+
 type RunHandle = {
   get proc(): ChildProcess | null;
   done: Promise<{ stdout: string; stderr: string; code: number }>;
 };
 
 function runChild(args: string[]): RunHandle {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (CURSOR_API_KEY) env.CURSOR_API_KEY = CURSOR_API_KEY;
-
+  const env = agentEnv();
   const bins = CURSOR_BIN ? [CURSOR_BIN] : ["agent", "cursor-agent"];
   let index = 0;
   let proc: ChildProcess | null = spawn(bins[index], args, {
@@ -126,11 +155,31 @@ function runChild(args: string[]): RunHandle {
   };
 }
 
+function formatMs(ms: number): string {
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  if (m <= 0) return `${s}s`;
+  return `${m}m ${s}s`;
+}
+
 export class Runner {
   private queue: Job[] = [];
   private draining = false;
   private handle: RunHandle | null = null;
   private cancelled = false;
+  private cancelReason: "user" | "watchdog" | null = null;
+  private runStartedAt: number | null = null;
+  private currentJob: Job | null = null;
+  private nudgesThisRun = 0;
+  private nudging = false;
+  private watchdog: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    this.watchdog = setInterval(() => {
+      void this.watchdogTick();
+    }, WATCHDOG_MS);
+    this.watchdog.unref();
+  }
 
   get queueLength(): number {
     return this.queue.length;
@@ -140,22 +189,100 @@ export class Runner {
     return this.draining || this.handle !== null;
   }
 
+  snapshot(): RunnerSnapshot {
+    return {
+      busy: this.busy,
+      queueLength: this.queue.length,
+      runningMs: this.runStartedAt ? Date.now() - this.runStartedAt : null,
+      currentPrompt: this.currentJob?.prompt ?? null,
+      nudgesThisRun: this.nudgesThisRun,
+    };
+  }
+
   enqueue(job: Job): void {
-    this.queue.push(job);
+    this.queue.push({ ...job, kind: job.kind ?? "user" });
     void this.drain();
   }
 
-  async cancel(): Promise<boolean> {
+  async cancel(reason: "user" | "watchdog" = "user"): Promise<boolean> {
     const child = this.handle?.proc;
     if (!child) return false;
     this.cancelled = true;
-    child.kill("SIGTERM");
+    this.cancelReason = reason;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
     setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
       }
     }, 3000).unref();
     return true;
+  }
+
+  async nudge(force = false): Promise<boolean> {
+    return this.nudgeStuck(force);
+  }
+
+  stop(): void {
+    if (this.watchdog) {
+      clearInterval(this.watchdog);
+      this.watchdog = null;
+    }
+  }
+
+  private async watchdogTick(): Promise<void> {
+    if (!this.handle || !this.runStartedAt) return;
+    const waited = Date.now() - this.runStartedAt;
+    if (waited < STUCK_MS) return;
+    if (this.queue.length < 1) return;
+    await this.nudgeStuck(false);
+  }
+
+  private async nudgeStuck(force: boolean): Promise<boolean> {
+    if (this.nudging) return false;
+    if (!this.handle && !force) return false;
+    if (!force && this.queue.length < 1) return false;
+    if (!force && this.runStartedAt && Date.now() - this.runStartedAt < STUCK_MS) return false;
+
+    this.nudging = true;
+    try {
+      const waited = this.runStartedAt ? Date.now() - this.runStartedAt : 0;
+      const waiting = this.queue.length;
+      const reply = this.currentJob?.reply ?? this.queue[0]?.reply;
+      if (!reply) return false;
+
+      if (this.currentJob?.kind === "wakeup" || this.nudgesThisRun >= 2) {
+        await this.cancel("watchdog");
+        await reply(
+          `Gave up after ${this.nudgesThisRun} nudge(s); Cursor CLI still looked stuck after ${formatMs(waited)}. Send a new prompt or /cancel.`,
+        );
+        return true;
+      }
+
+      this.nudgesThisRun += 1;
+      if (this.queue[0]?.kind !== "wakeup") {
+        this.queue.unshift({
+          prompt: WAKE_PROMPT,
+          reply,
+          kind: "wakeup",
+        });
+      }
+
+      await reply(
+        `Agent still running after ${formatMs(waited)} with ${waiting} waiting. Nudging Cursor with a wake-up/status prompt…`,
+      );
+      await this.cancel("watchdog");
+      return true;
+    } finally {
+      this.nudging = false;
+    }
   }
 
   private async drain(): Promise<void> {
@@ -171,12 +298,18 @@ export class Runner {
     } finally {
       this.draining = false;
       this.handle = null;
+      this.runStartedAt = null;
+      this.currentJob = null;
       await saveState({ status: "idle" });
     }
   }
 
   private async run(job: Job): Promise<void> {
     this.cancelled = false;
+    this.cancelReason = null;
+    if (job.kind !== "wakeup") this.nudgesThisRun = 0;
+    this.currentJob = job;
+    this.runStartedAt = Date.now();
     await appendThread("user", job.prompt);
     const state = await loadState();
 
@@ -207,20 +340,21 @@ export class Runner {
       ({ stdout, stderr, code } = await handle.done);
     } catch (err) {
       this.handle = null;
-      const message =
-        err instanceof Error && (err as NodeJS.ErrnoException).code === "ENOENT"
-          ? "Cursor CLI not found. Install it (`curl https://cursor.com/install -fsS | bash`) and ensure `agent` is on PATH."
-          : err instanceof Error
-            ? err.message
-            : "failed to start agent";
+      const message = failMessage(err);
       await appendThread("system", message);
       await job.reply(`Agent failed: ${message}`);
       return;
     } finally {
       this.handle = null;
+      this.runStartedAt = null;
+      this.currentJob = null;
     }
 
     if (this.cancelled) {
+      if (this.cancelReason === "watchdog") {
+        await appendThread("system", "watchdog cancelled run");
+        return;
+      }
       const message = "Cancelled.";
       await appendThread("system", message);
       await job.reply(message);
@@ -243,7 +377,7 @@ export class Runner {
       await appendThread("assistant", text);
       await job.reply(text);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "could not parse agent output";
+      const message = failMessage(err);
       await appendThread("system", message);
       await job.reply(`Agent failed: ${message}`);
     }

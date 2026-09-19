@@ -1,16 +1,29 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { LOCK_PATH, WORKSPACE_PATH, assertWorkspace } from "./config.ts";
+import { LOCK_PATH, STUCK_MS, WORKSPACE_PATH, assertWorkspace } from "./config.ts";
 import { Runner } from "./runner.ts";
 import { loadState, saveState } from "./state.ts";
 import { connectedAs, sendText, startWhatsApp, stopWhatsApp } from "./whatsapp.ts";
 
 const HELP = `Commands:
 /help — this text
-/status — idle/busy, queue, session
+/status — idle/busy, queue, how long the current run has been going
 /new — start a fresh Cursor chat (next prompt is a new session)
 /cancel — stop the current agent run
+/nudge — kill a stuck run and ask Cursor for a wake-up/status
+
+status, help, new, cancel, nudge also work without the slash.
 
 Anything else is sent to Cursor. Smoke test: "do not edit files, just reply pong"`;
+
+const COMMANDS = new Set(["help", "status", "new", "cancel", "nudge"]);
+
+function parseCommand(text: string): string | null {
+  const cleaned = text.replace(/[\u200b-\u200d\ufeff]/g, "").trim();
+  const match = cleaned.match(/^[/\uFF0F]?([A-Za-z]+)\s*$/);
+  if (!match) return null;
+  const cmd = match[1].toLowerCase();
+  return COMMANDS.has(cmd) ? cmd : null;
+}
 
 function acquireLock(): void {
   if (existsSync(LOCK_PATH)) {
@@ -45,6 +58,20 @@ function shortSession(id: string | null): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
 }
 
+function preview(text: string | null): string {
+  if (!text) return "(none)";
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= 80 ? flat : `${flat.slice(0, 77)}...`;
+}
+
+function formatMs(ms: number | null): string {
+  if (ms == null) return "(not running)";
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  if (m <= 0) return `${s}s`;
+  return `${m}m ${s}s`;
+}
+
 async function main(): Promise<void> {
   assertWorkspace();
   acquireLock();
@@ -52,8 +79,9 @@ async function main(): Promise<void> {
   const runner = new Runner();
 
   const shutdown = () => {
+    runner.stop();
     stopWhatsApp();
-    void runner.cancel();
+    void runner.cancel("user");
     releaseLock();
     process.exit(0);
   };
@@ -61,21 +89,27 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   console.log(`Workspace: ${WORKSPACE_PATH}`);
+  console.log(`Stuck watchdog: ${Math.round(STUCK_MS / 60000)}m if queue is waiting`);
   await startWhatsApp({
     startedAtSec,
     onMessage: async (msg) => {
       const text = msg.text.trim();
       const reply = (body: string) => sendText(msg.jid, body);
+      const command = parseCommand(text);
 
-      if (text === "/help") {
+      if (command === "help") {
         await reply(HELP);
         return;
       }
-      if (text === "/status") {
+      if (command === "status") {
         const state = await loadState();
+        const snap = runner.snapshot();
         const lines = [
-          `status: ${runner.busy ? "busy" : "idle"}`,
-          `queue: ${runner.queueLength}`,
+          `status: ${snap.busy ? "busy" : "idle"}`,
+          `running: ${formatMs(snap.runningMs)}`,
+          `queue: ${snap.queueLength}`,
+          `nudges: ${snap.nudgesThisRun}`,
+          `current: ${preview(snap.currentPrompt)}`,
           `session: ${shortSession(state.sessionId)}`,
           `whatsapp: ${connectedAs()}`,
           `workspace: ${WORKSPACE_PATH}`,
@@ -83,14 +117,19 @@ async function main(): Promise<void> {
         await reply(lines.join("\n"));
         return;
       }
-      if (text === "/new") {
+      if (command === "new") {
         await saveState({ sessionId: null });
         await reply("Next prompt starts a fresh Cursor chat.");
         return;
       }
-      if (text === "/cancel") {
-        const killed = await runner.cancel();
+      if (command === "cancel") {
+        const killed = await runner.cancel("user");
         await reply(killed ? "Cancelling current run…" : "Nothing to cancel.");
+        return;
+      }
+      if (command === "nudge") {
+        const nudged = await runner.nudge(true);
+        await reply(nudged ? "Nudging stuck Cursor run…" : "Nothing to nudge.");
         return;
       }
 

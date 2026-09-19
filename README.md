@@ -45,11 +45,16 @@ You should get `On it.` then a short Cursor reply. Only that chat is accepted; g
 | Command | What it does |
 | --- | --- |
 | `/help` | List commands |
-| `/status` | Idle/busy, queue length, session |
+| `/status` | Idle/busy, run duration, queue, current prompt |
 | `/new` | Forget the Cursor session; next prompt starts fresh |
 | `/cancel` | Kill the in-flight `agent` process |
+| `/nudge` | Kill a stuck run and send Cursor a wake-up/status prompt |
 
-Anything else is queued and sent to Cursor. Follow-ups `--resume` the same CLI session so context sticks. While a run is in progress, later messages wait in order instead of overlapping.
+`status`, `help`, `new`, `cancel`, and `nudge` also work without the slash, as long as that is the whole message. Anything else is queued and sent to Cursor.
+
+If a run stays busy with at least one prompt waiting for 10 minutes (`STUCK_MINUTES` in `.env`), the daemon kills that `agent` process and auto-queues a short wake-up prompt so you get a status instead of a silent hang. After two nudges it gives up and tells you.
+
+Follow-ups `--resume` the same CLI session so context sticks. While a run is in progress, later messages wait in order instead of overlapping.
 
 ## Point it at another repo
 

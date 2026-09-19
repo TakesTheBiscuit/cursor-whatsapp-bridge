@@ -22,6 +22,10 @@ export const CURSOR_API_KEY = optional("CURSOR_API_KEY");
 export const CURSOR_MODEL = optional("CURSOR_MODEL");
 export const CURSOR_BIN = optional("CURSOR_BIN");
 
+const stuckMinutes = Number(optional("STUCK_MINUTES") ?? "10");
+export const STUCK_MS = (Number.isFinite(stuckMinutes) && stuckMinutes > 0 ? stuckMinutes : 10) * 60 * 1000;
+export const WATCHDOG_MS = 30_000;
+
 export const AUTH_DIR = resolve(ROOT_DIR, "auth");
 export const DATA_DIR = resolve(ROOT_DIR, "data");
 export const LOCK_PATH = resolve(ROOT_DIR, ".agent.lock");
